@@ -163,6 +163,12 @@ const ACP_FIRST_PROMPT_MAX_RETRIES = 2;
 /** Backoff before each first-prompt retry, scaled by attempt (250ms, then 500ms). */
 const ACP_FIRST_PROMPT_RETRY_BASE_DELAY_MS = 250;
 const ACP_BUSY_SETTLE_WAIT_MS = 5_000;
+/**
+ * Default model settlement timeout: when no --model is passed but modelRoles.default is configured,
+ * we wait for the SDK to apply the default before answering session/new, so the model option is present.
+ * The SDK applies defaults synchronously for known models, so this is a bounded safety timeout.
+ */
+const ACP_MODEL_SETTLEMENT_TIMEOUT_MS = 500;
 
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
@@ -1886,6 +1892,7 @@ export class AcpAgent implements Agent {
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
 			await applyAcpStartupOptions(this.#adapter(id), this.#startupOptions);
+			await this.#waitForModelSettle(id);
 			const response = { sessionId: id, ...(await this.#sessionState(id, true)) };
 			this.#scheduleBootstrap(id);
 			return response;
@@ -5296,6 +5303,36 @@ export class AcpAgent implements Agent {
 			await this.#failSession(id, record.adapter, failure);
 			throw failure;
 		}
+	}
+
+	/**
+	 * Waits for the model to settle in the session config. When no --model is passed but
+	 * modelRoles.default is configured, the SDK applies the default asynchronously.
+	 * We need to wait for this settlement before returning session/new so the model option
+	 * is always present and clients (like Paseo) can apply the configured default.
+	 */
+	async #waitForModelSettle(id: string): Promise<void> {
+		const record = this.#sessions.get(id);
+		if (!record) return; // Session was closed; skip settlement wait.
+
+		// If an explicit --model was passed, it's already settled by applyAcpStartupOptions.
+		if (this.#startupOptions?.modelId) return;
+
+		// Query the config once to check if the model is already settled.
+		let config = await record.adapter.query("config.list/get");
+		const currentModel = configValues(config).get(MODEL_CONFIG_ID);
+		if (currentModel !== undefined) return; // Model is settled.
+
+		// No explicit model and no settled value: wait for the SDK to apply the default.
+		// Retry with a bounded timeout (issue #6009).
+		const deadline = Date.now() + ACP_MODEL_SETTLEMENT_TIMEOUT_MS;
+		while (Date.now() < deadline) {
+			await Bun.sleep(50); // Small delay before retry.
+			config = await record.adapter.query("config.list/get");
+			if (configValues(config).get(MODEL_CONFIG_ID) !== undefined) return; // Settled.
+		}
+		// Timeout: proceed without waiting. The model might settle later, but we must
+		// not block session/new indefinitely (issue #6009).
 	}
 
 	async #sessionState(
