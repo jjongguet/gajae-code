@@ -1752,7 +1752,8 @@ export class AcpAgent implements Agent {
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
-	readonly #delayModelSettlementForTest: number | undefined;
+	readonly #modelSettlementQueriesForTest: number | undefined;
+	readonly #modelSettlementTestQueryCounts = new Map<string, number>();
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
@@ -1764,8 +1765,8 @@ export class AcpAgent implements Agent {
 					startupOptions?: AcpStartupOptions;
 					cancelSettlementGraceMs?: number;
 					promptWatchdogClock?: PromptWatchdogClock;
-					/** Test hook: delay model settlement by this many milliseconds (for regression testing issue #6009) */
-					delayModelSettlementForTest?: number;
+					/** Test option: intercept config.list/get to simulate delayed model settlement for the first K calls (regression testing issue #6009) */
+					modelSettlementQueriesForTest?: number;
 			  }
 			| unknown,
 	) {
@@ -1812,8 +1813,10 @@ export class AcpAgent implements Agent {
 				? candidate.cancelSettlementGraceMs
 				: CANCEL_SETTLEMENT_GRACE_MS;
 		this.#promptWatchdogClock = parsePromptWatchdogClock(candidate?.promptWatchdogClock) ?? systemPromptWatchdogClock;
-		this.#delayModelSettlementForTest =
-			typeof candidate?.delayModelSettlementForTest === "number" ? candidate.delayModelSettlementForTest : undefined;
+		this.#modelSettlementQueriesForTest =
+			typeof candidate?.modelSettlementQueriesForTest === "number"
+				? candidate.modelSettlementQueriesForTest
+				: undefined;
 		queueMicrotask(() => {
 			if (connection.signal.aborted) {
 				this.#beginDispose();
@@ -3411,6 +3414,72 @@ export class AcpAgent implements Agent {
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
 			});
+			// Wrap adapter query for test: simulate delayed model settlement
+			if (this.#modelSettlementQueriesForTest !== undefined) {
+				const originalQuery = adapter.query.bind(adapter);
+				const testQueryLimit = this.#modelSettlementQueriesForTest;
+				let queryCount = 0;
+				// Type-safe wrapper for query method
+				const wrappedQuery = async (operation: string, input?: JsonObject, cursor?: string): Promise<unknown> => {
+					if (operation === "config.list/get") {
+						queryCount++;
+						const result = await originalQuery(operation, input, cursor);
+						// Extract the page items from the response structure
+						const response = object(result);
+						if (!response) return result;
+						const resultObj = object(response.result) ?? response;
+						const page = object(resultObj?.page) ?? {};
+						const items = Array.isArray(page.items) ? (page.items as unknown[]) : [];
+
+						if (queryCount <= testQueryLimit) {
+							// First K queries: filter out the model value (simulate SDK not yet having applied the default)
+							const filtered = items.filter((item: unknown) => {
+								const itemObj = object(item);
+								return itemObj?.id !== MODEL_CONFIG_ID;
+							});
+							// Reconstruct the response with filtered items
+							const filteredPage: Record<string, unknown> = { ...page, items: filtered, complete: true };
+							if (response.result !== undefined && resultObj) {
+								const modifiedResultObj: Record<string, unknown> = {
+									...(resultObj as Record<string, unknown>),
+									page: filteredPage,
+								};
+								return { ...(response as Record<string, unknown>), result: modifiedResultObj };
+							}
+							return { ...(response as Record<string, unknown>), page: filteredPage };
+						}
+						// After K queries: return config WITH model value (simulate SDK having applied the default)
+						const hasModel = items.some((item: unknown) => {
+							const itemObj = object(item);
+							return itemObj?.id === MODEL_CONFIG_ID;
+						});
+						let finalItems = items;
+						// Inject model if not present (simulate SDK applying default)
+						if (!hasModel) {
+							finalItems = [
+								...items,
+								{
+									id: MODEL_CONFIG_ID,
+									value: "anthropic/claude-3-5-sonnet",
+									settingKeys: { model: "anthropic/claude-3-5-sonnet" },
+								} as unknown,
+							];
+						}
+						// Reconstruct the response with the model item
+						const modelPage: Record<string, unknown> = { ...page, items: finalItems, complete: true };
+						if (response.result !== undefined && resultObj) {
+							const modifiedResultObj: Record<string, unknown> = {
+								...(resultObj as Record<string, unknown>),
+								page: modelPage,
+							};
+							return { ...(response as Record<string, unknown>), result: modifiedResultObj };
+						}
+						return { ...(response as Record<string, unknown>), page: modelPage };
+					}
+					return originalQuery(operation, input, cursor);
+				};
+				adapter.query = wrappedQuery;
+			}
 			unsubscribePendingFrames = adapter.onFrame(frame => pendingAdapterFrames.push(frame));
 			this.#pendingRouterAdapters.set(id, adapter);
 			// Query startup provenance before activating reverse providers. A CLI
@@ -4121,6 +4190,7 @@ export class AcpAgent implements Agent {
 					this.#fenceRetiredPromptAcknowledgement(id, waiter);
 				}
 				this.#sessions.delete(id);
+				this.#modelSettlementTestQueryCounts.delete(id);
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
 				record.activePrompt = undefined;
@@ -5322,12 +5392,6 @@ export class AcpAgent implements Agent {
 
 		// If an explicit --model was passed, it's already settled by applyAcpStartupOptions.
 		if (this.#startupOptions?.modelId) return;
-
-		// Test hook: delay model settlement to simulate SDK applying default asynchronously.
-		// This is used for regression testing issue #6009.
-		if (this.#delayModelSettlementForTest !== undefined) {
-			await Bun.sleep(this.#delayModelSettlementForTest);
-		}
 
 		// Query the config once to check if the model is already settled.
 		let config = await record.adapter.query("config.list/get");
