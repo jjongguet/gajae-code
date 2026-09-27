@@ -1,6 +1,5 @@
 import { expect, test } from "bun:test";
 import type { AcpSdkAdapter } from "../../src/sdk/acp/adapter";
-import { configValues } from "../../src/modes/acp/acp-agent";
 
 /**
  * Regression test for issue #6009: ACP session/new should include the model config option
@@ -78,15 +77,15 @@ test("ACP session/new waits for model to settle when modelRoles.default is confi
 	} as unknown as AcpSdkAdapter;
 
 	// Simulate the wait for model settlement - the fix should retry until model appears
-	const configMap = await mockAdapter.query("config.list/get");
-	const values1 = configValues(configMap);
-	expect(values1.get("model")).toBeUndefined(); // First query has no model
+	const firstConfig = (await mockAdapter.query("config.list/get")) as { result: { id: string; value: string }[] };
+	const firstModel = firstConfig.result?.find(item => item.id === "model");
+	expect(firstModel).toBeUndefined(); // First query has no model
 
 	// Call again to simulate the retry
-	const configMap2 = await mockAdapter.query("config.list/get");
-	const values2 = configValues(configMap2);
-	expect(values2.get("model")).toEqual("openai-codex/gpt-6-sol"); // Second query has model
+	const secondConfig = (await mockAdapter.query("config.list/get")) as { result: { id: string; value: string }[] };
+	const secondModel = secondConfig.result?.find(item => item.id === "model");
+	expect(secondModel?.value).toEqual("openai-codex/gpt-6-sol"); // Second query has model
 
-	// The actual session/new will now get the model because #waitForModelSettle ensures it
-	expect(queryCallCount).toBeGreaterThanOrEqual(1);
+	// Verify that multiple queries were made (simulating the retry behavior)
+	expect(queryCallCount).toBeGreaterThanOrEqual(2);
 });
