@@ -5323,16 +5323,25 @@ export class AcpAgent implements Agent {
 		const currentModel = configValues(config).get(MODEL_CONFIG_ID);
 		if (currentModel !== undefined) return; // Model is settled.
 
-		// No explicit model and no settled value: wait for the SDK to apply the default.
-		// Retry with a bounded timeout (issue #6009).
+		// No explicit model and no settled value: the SDK may be applying a default.
+		// Wait for the SDK to apply the default with a bounded timeout (issue #6009).
+		// Only wait if there's a chance a default is configured (inferred by lack of model in first query).
 		const deadline = Date.now() + ACP_MODEL_SETTLEMENT_TIMEOUT_MS;
 		while (Date.now() < deadline) {
 			await Bun.sleep(50); // Small delay before retry.
 			config = await record.adapter.query("config.list/get");
 			if (configValues(config).get(MODEL_CONFIG_ID) !== undefined) return; // Settled.
 		}
-		// Timeout: proceed without waiting. The model might settle later, but we must
-		// not block session/new indefinitely (issue #6009).
+
+		// Timeout: no model settled. Log a diagnostic message for troubleshooting.
+		// We proceed without blocking session/new, but this indicates the SDK did not apply
+		// a default (either no default was configured, or the SDK had an issue applying it).
+		const diagnosticMessage =
+			`[issue #6009] Model settlement timeout for session ${id}: ` +
+			`SDK did not apply a configured default model within 500ms. ` +
+			`The model option may be missing from session/new response. ` +
+			`If a default model is configured, check SDK logs for issues.`;
+		logger.debug(diagnosticMessage);
 	}
 
 	async #sessionState(
