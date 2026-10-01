@@ -5306,8 +5306,6 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Waits for the model to settle in the session config. When no --model is passed but
-	/**
 	 * Wait for the model to settle when no explicit --model was passed but a default might be configured.
 	 * Give each probe its own timeout clamped to the remaining budget so wedged probes cannot exceed 500ms total.
 	 * Catch probe errors as advisory so a rejected probe does not discard the session (issue #6009).
@@ -5319,10 +5317,29 @@ export class AcpAgent implements Agent {
 		// If an explicit --model was passed, it's already settled by applyAcpStartupOptions.
 		if (this.#startupOptions?.modelId) return;
 
+		// Set the deadline once for all probes (including the first).
+		const deadline = Date.now() + ACP_MODEL_SETTLEMENT_TIMEOUT_MS;
+
 		// Query the config once to check if the model is already settled.
+		// Even the first probe gets its own timeout clamped to the remaining budget.
 		let config: unknown;
 		try {
-			config = await record.adapter.query("config.list/get");
+			const remaining = deadline - Date.now();
+			if (remaining > 0) {
+				const controller = new AbortController();
+				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
+				try {
+					const timeoutPromise = new Promise<never>((_, reject) => {
+						const listener = () => reject(new Error("probe_timeout"));
+						controller.signal.addEventListener("abort", listener);
+					});
+					config = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
+				} finally {
+					clearTimeout(timeoutHandle);
+				}
+			} else {
+				return; // Budget exhausted before first probe.
+			}
 		} catch {
 			// Advisory: ignore probe error and proceed without the model.
 			return;
@@ -5333,7 +5350,6 @@ export class AcpAgent implements Agent {
 		// No explicit model and no settled value: the SDK may be applying a default.
 		// Retry with a bounded timeout, where each probe gets its own timeout clamped to the remaining budget.
 		// Only wait if there's a reasonable chance a default is configured (no model after first probe).
-		const deadline = Date.now() + ACP_MODEL_SETTLEMENT_TIMEOUT_MS;
 		while (Date.now() < deadline) {
 			await Bun.sleep(50); // Small delay before retry.
 			const remaining = deadline - Date.now();
