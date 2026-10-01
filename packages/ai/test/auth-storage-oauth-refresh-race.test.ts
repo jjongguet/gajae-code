@@ -2257,7 +2257,10 @@ describe("AuthStorage OAuth refresh race", () => {
 		await expect(authStorage.refreshCredentialById(credentialId)).rejects.toBe(originalError);
 		await expect(authStorage.getApiKey(provider, "release-provider-rejection")).resolves.toBeUndefined();
 		expect(refreshCalls).toBe(1);
-		expect(releaseSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+		// Each attempt owns its lease. The follow-up attempt cannot claim the
+		// lease the failed release left behind, so it surfaces the replay memo
+		// without claiming (and therefore without releasing) anything.
+		expect(releaseSpy).toHaveBeenCalledTimes(1);
 		expect(warnSpy).toHaveBeenCalledWith(
 			"OAuth refresh lease release failed",
 			expect.objectContaining({

@@ -5667,6 +5667,12 @@ export class AuthStorage {
 								persistedByLease: true,
 							};
 						}
+						// A failure that predates this attempt already forbids dialing with
+						// this token, so do not wait out a lease (possibly one a failed
+						// release left behind) only to surface the same memoized failure.
+						if (initialRefreshFailure && initialRefreshFailure.expiresAt > Date.now()) {
+							failBeforeRefresh(initialRefreshFailure.error);
+						}
 						if (Date.now() >= deadline) {
 							throw new Error("OAuth token refresh ownership remained ambiguous");
 						}
