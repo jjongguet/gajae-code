@@ -237,11 +237,11 @@ function sanitizeStagedPayload(payload: Record<string, unknown>): {
 }
 
 /**
- * Self-heal a poisoned merge base: a persisted `state.intent_contract` that
- * fails canonical validation can only come from a pre-guard poisoned write
- * (the recorder always persists valid manifests). Left in place it makes
- * every merge throw, bricking the interview. Drop it (and any equally
- * unverifiable intent_review) from the base and report the repair.
+ * Validate a persisted `state.intent_contract`: if it fails canonical validation
+ * and `intent_contract_required === true`, the contract is locked and must be valid.
+ * Fail closed with an integrity error to preserve the invalid contract for recovery/audit.
+ * When intent_contract_required is absent or false, healing may occur for backward
+ * compatibility with pre-guard poisoned writes, but only after explicit authorization.
  */
 function healPoisonedIntentContract(base: Record<string, unknown>): {
 	base: Record<string, unknown>;
@@ -253,7 +253,16 @@ function healPoisonedIntentContract(base: Record<string, unknown>): {
 	try {
 		assertDeepInterviewIntentManifest(state.intent_contract);
 		return { base, healed: false };
-	} catch {
+	} catch (error) {
+		// If intent_contract_required is set (locked contract), fail closed
+		if (state.intent_contract_required === true) {
+			throw new DeepInterviewStageError(
+				"DI_STAGE_STATE_CORRUPT",
+				`locked intent contract is malformed or tampered: ${error instanceof Error ? error.message : String(error)}`,
+				"preserve the state for recovery; contact support with the session state for audit",
+			);
+		}
+		// For unlocked contracts, continue with healing for backward compatibility
 		const healedState = { ...state };
 		delete healedState.intent_contract;
 		delete healedState.intent_review;

@@ -6517,7 +6517,6 @@ export function isProjectSessionTranscriptPath(projectGjcDir: string, filePath: 
 	if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
 	const segments = relative.split(path.sep);
 	if (segments.includes(SESSION_STAGING_DIRNAME)) return false;
-	if (segments.length === 1) return true;
 	const parent = segments.at(-2);
 	return parent === "agent-session" || segments.includes("sessions");
 }

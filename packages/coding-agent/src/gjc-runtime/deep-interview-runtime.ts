@@ -655,16 +655,15 @@ export async function authoritativeConversationSnapshot(
 			const explicitRealPath = await fs.realpath(sessionFile);
 			if (explicitRealPath !== sessionFile) throw new Error("symlink transcript");
 			sessionFile = explicitRealPath;
-			explicitProjectTranscript = isManagedProjectSessionTranscriptPath(path.resolve(cwd, ".gjc"), explicitRealPath);
-			if (
-				explicitProjectTranscript &&
-				!readAuthorizedProjectSessionTranscript(
-					path.resolve(cwd, ".gjc"),
-					explicitRealPath,
-					RESUME_TRANSCRIPT_MAX_BYTES,
-				)
-			)
-				throw new Error("unauthorized project transcript");
+			// Try authorized read first (atomic identity-bound read); if it fails,
+			// the transcript is either unauthorized or not a managed project transcript.
+			const authorizedBytes = readAuthorizedProjectSessionTranscript(
+				path.resolve(cwd, ".gjc"),
+				explicitRealPath,
+				RESUME_TRANSCRIPT_MAX_BYTES,
+			);
+			explicitProjectTranscript = !!authorizedBytes;
+			if (!explicitProjectTranscript) throw new Error("unauthorized project transcript");
 		} catch {
 			throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is not a managed canonical session transcript");
 		}
@@ -718,11 +717,14 @@ export async function authoritativeConversationSnapshot(
 		for (const candidate of [...canonicalCandidates].sort()) {
 			try {
 				const projectGjcDir = path.resolve(cwd, ".gjc");
-				const bytes = isManagedProjectSessionTranscriptPath(projectGjcDir, candidate)
-					? readAuthorizedProjectSessionTranscript(projectGjcDir, candidate, RESUME_TRANSCRIPT_MAX_BYTES)
-					: await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
-							allowMissing: true,
-						});
+				// Try authorized project session transcript first (atomic identity-bound read),
+				// then fall back to general bounded read for non-managed transcripts.
+				let bytes = readAuthorizedProjectSessionTranscript(projectGjcDir, candidate, RESUME_TRANSCRIPT_MAX_BYTES);
+				if (!bytes) {
+					bytes = await readBoundedFileBytes(candidate, RESUME_TRANSCRIPT_MAX_BYTES, "session transcript", {
+						allowMissing: true,
+					});
+				}
 				if (!bytes) continue;
 				const header = JSON.parse(boundedUtf8(bytes, "session transcript").split(/\r?\n/, 1)[0]) as Record<
 					string,
@@ -743,9 +745,12 @@ export async function authoritativeConversationSnapshot(
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
 		const projectGjcDir = path.resolve(cwd, ".gjc");
-		const bytes = isManagedProjectSessionTranscriptPath(projectGjcDir, sessionFile)
-			? readAuthorizedProjectSessionTranscript(projectGjcDir, sessionFile, RESUME_TRANSCRIPT_MAX_BYTES)
-			: await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
+		// Try authorized project session transcript first (atomic identity-bound read),
+		// then fall back to general bounded read for non-managed transcripts.
+		let bytes = readAuthorizedProjectSessionTranscript(projectGjcDir, sessionFile, RESUME_TRANSCRIPT_MAX_BYTES);
+		if (!bytes) {
+			bytes = await readBoundedFileBytes(sessionFile, RESUME_TRANSCRIPT_MAX_BYTES, "live session transcript");
+		}
 		if (!bytes) throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
 		const text = boundedUtf8(bytes, "live session transcript");
 		const records: unknown[] = [];
