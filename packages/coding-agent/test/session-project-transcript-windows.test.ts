@@ -101,6 +101,8 @@ describe("Windows bounded project transcript reads", () => {
 		expect(
 			readAuthorizedProjectSessionTranscript(root, path.join(root, "audit", "events.jsonl"), 4096),
 		).toBeUndefined();
+		// Root-level files in .gjc/ are explicitly rejected to prevent forged evidence
+		expect(readAuthorizedProjectSessionTranscript(root, path.join(root, "forged.jsonl"), 4096)).toBeUndefined();
 	});
 
 	it("rejects hardlinked transcript files", async () => {
