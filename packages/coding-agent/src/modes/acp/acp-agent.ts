@@ -1745,15 +1745,13 @@ export class AcpAgent implements Agent {
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
 	readonly #sessionEpochs = new Map<string, number>();
-	#tearingDown = new Map<string, number>();
-	#lifecycleOperations = new Map<string, Promise<void>>();
+	readonly #tearingDown = new Map<string, number>();
+	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
-	readonly #modelSettlementQueriesForTest: number | undefined;
-	readonly #modelSettlementTestQueryCounts = new Map<string, number>();
 	#disposed = false;
 	#disposePromise: Promise<void> | undefined;
 
@@ -1765,8 +1763,6 @@ export class AcpAgent implements Agent {
 					startupOptions?: AcpStartupOptions;
 					cancelSettlementGraceMs?: number;
 					promptWatchdogClock?: PromptWatchdogClock;
-					/** Test option: intercept config.list/get to simulate delayed model settlement for the first K calls (regression testing issue #6009) */
-					modelSettlementQueriesForTest?: number;
 			  }
 			| unknown,
 	) {
@@ -1813,10 +1809,6 @@ export class AcpAgent implements Agent {
 				? candidate.cancelSettlementGraceMs
 				: CANCEL_SETTLEMENT_GRACE_MS;
 		this.#promptWatchdogClock = parsePromptWatchdogClock(candidate?.promptWatchdogClock) ?? systemPromptWatchdogClock;
-		this.#modelSettlementQueriesForTest =
-			typeof candidate?.modelSettlementQueriesForTest === "number"
-				? candidate.modelSettlementQueriesForTest
-				: undefined;
 		queueMicrotask(() => {
 			if (connection.signal.aborted) {
 				this.#beginDispose();
@@ -3414,72 +3406,6 @@ export class AcpAgent implements Agent {
 				connection: this.#reverseConnection(id),
 				providers: this.#providers(),
 			});
-			// Wrap adapter query for test: simulate delayed model settlement
-			if (this.#modelSettlementQueriesForTest !== undefined) {
-				const originalQuery = adapter.query.bind(adapter);
-				const testQueryLimit = this.#modelSettlementQueriesForTest;
-				let queryCount = 0;
-				// Type-safe wrapper for query method
-				const wrappedQuery = async (operation: string, input?: JsonObject, cursor?: string): Promise<unknown> => {
-					if (operation === "config.list/get") {
-						queryCount++;
-						const result = await originalQuery(operation, input, cursor);
-						// Extract the page items from the response structure
-						const response = object(result);
-						if (!response) return result;
-						const resultObj = object(response.result) ?? response;
-						const page = object(resultObj?.page) ?? {};
-						const items = Array.isArray(page.items) ? (page.items as unknown[]) : [];
-
-						if (queryCount <= testQueryLimit) {
-							// First K queries: filter out the model value (simulate SDK not yet having applied the default)
-							const filtered = items.filter((item: unknown) => {
-								const itemObj = object(item);
-								return itemObj?.id !== MODEL_CONFIG_ID;
-							});
-							// Reconstruct the response with filtered items
-							const filteredPage: Record<string, unknown> = { ...page, items: filtered, complete: true };
-							if (response.result !== undefined && resultObj) {
-								const modifiedResultObj: Record<string, unknown> = {
-									...(resultObj as Record<string, unknown>),
-									page: filteredPage,
-								};
-								return { ...(response as Record<string, unknown>), result: modifiedResultObj };
-							}
-							return { ...(response as Record<string, unknown>), page: filteredPage };
-						}
-						// After K queries: return config WITH model value (simulate SDK having applied the default)
-						const hasModel = items.some((item: unknown) => {
-							const itemObj = object(item);
-							return itemObj?.id === MODEL_CONFIG_ID;
-						});
-						let finalItems = items;
-						// Inject model if not present (simulate SDK applying default)
-						if (!hasModel) {
-							finalItems = [
-								...items,
-								{
-									id: MODEL_CONFIG_ID,
-									value: "anthropic/claude-3-5-sonnet",
-									settingKeys: { model: "anthropic/claude-3-5-sonnet" },
-								} as unknown,
-							];
-						}
-						// Reconstruct the response with the model item
-						const modelPage: Record<string, unknown> = { ...page, items: finalItems, complete: true };
-						if (response.result !== undefined && resultObj) {
-							const modifiedResultObj: Record<string, unknown> = {
-								...(resultObj as Record<string, unknown>),
-								page: modelPage,
-							};
-							return { ...(response as Record<string, unknown>), result: modifiedResultObj };
-						}
-						return { ...(response as Record<string, unknown>), page: modelPage };
-					}
-					return originalQuery(operation, input, cursor);
-				};
-				adapter.query = wrappedQuery;
-			}
 			unsubscribePendingFrames = adapter.onFrame(frame => pendingAdapterFrames.push(frame));
 			this.#pendingRouterAdapters.set(id, adapter);
 			// Query startup provenance before activating reverse providers. A CLI
@@ -4190,7 +4116,6 @@ export class AcpAgent implements Agent {
 					this.#fenceRetiredPromptAcknowledgement(id, waiter);
 				}
 				this.#sessions.delete(id);
-				this.#modelSettlementTestQueryCounts.delete(id);
 				record.unsubscribe();
 				record.reconnectUnsubscribe();
 				record.activePrompt = undefined;
@@ -5382,9 +5307,10 @@ export class AcpAgent implements Agent {
 
 	/**
 	 * Waits for the model to settle in the session config. When no --model is passed but
-	 * modelRoles.default is configured, the SDK applies the default asynchronously.
-	 * We need to wait for this settlement before returning session/new so the model option
-	 * is always present and clients (like Paseo) can apply the configured default.
+	/**
+	 * Wait for the model to settle when no explicit --model was passed but a default might be configured.
+	 * Give each probe its own timeout clamped to the remaining budget so wedged probes cannot exceed 500ms total.
+	 * Catch probe errors as advisory so a rejected probe does not discard the session (issue #6009).
 	 */
 	async #waitForModelSettle(id: string): Promise<void> {
 		const record = this.#sessions.get(id);
@@ -5394,29 +5320,47 @@ export class AcpAgent implements Agent {
 		if (this.#startupOptions?.modelId) return;
 
 		// Query the config once to check if the model is already settled.
-		let config = await record.adapter.query("config.list/get");
+		let config: unknown;
+		try {
+			config = await record.adapter.query("config.list/get");
+		} catch {
+			// Advisory: ignore probe error and proceed without the model.
+			return;
+		}
 		const currentModel = configValues(config).get(MODEL_CONFIG_ID);
 		if (currentModel !== undefined) return; // Model is settled.
 
 		// No explicit model and no settled value: the SDK may be applying a default.
-		// Wait for the SDK to apply the default with a bounded timeout (issue #6009).
-		// Only wait if there's a chance a default is configured (inferred by lack of model in first query).
+		// Retry with a bounded timeout, where each probe gets its own timeout clamped to the remaining budget.
+		// Only wait if there's a reasonable chance a default is configured (no model after first probe).
 		const deadline = Date.now() + ACP_MODEL_SETTLEMENT_TIMEOUT_MS;
 		while (Date.now() < deadline) {
 			await Bun.sleep(50); // Small delay before retry.
-			config = await record.adapter.query("config.list/get");
-			if (configValues(config).get(MODEL_CONFIG_ID) !== undefined) return; // Settled.
-		}
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break; // Budget exhausted.
 
-		// Timeout: no model settled. Log a diagnostic message for troubleshooting.
-		// We proceed without blocking session/new, but this indicates the SDK did not apply
-		// a default (either no default was configured, or the SDK had an issue applying it).
-		const diagnosticMessage =
-			`[issue #6009] Model settlement timeout for session ${id}: ` +
-			`SDK did not apply a configured default model within 500ms. ` +
-			`The model option may be missing from session/new response. ` +
-			`If a default model is configured, check SDK logs for issues.`;
-		logger.debug(diagnosticMessage);
+			let nextConfig: unknown;
+			try {
+				// Give this probe its own timeout clamped to the remaining budget.
+				// A wedged probe will timeout after `remaining` ms, not the full SDK timeout.
+				const controller = new AbortController();
+				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
+				try {
+					const timeoutPromise = new Promise<never>((_, reject) => {
+						const listener = () => reject(new Error("probe_timeout"));
+						controller.signal.addEventListener("abort", listener);
+					});
+					nextConfig = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
+				} finally {
+					clearTimeout(timeoutHandle);
+				}
+			} catch {
+				// Advisory: probe failed or timed out; proceed without waiting further.
+				return;
+			}
+			if (configValues(nextConfig).get(MODEL_CONFIG_ID) !== undefined) return; // Settled.
+		}
+		// Budget exhausted: proceed without model. The model option may be missing from the response.
 	}
 
 	async #sessionState(
