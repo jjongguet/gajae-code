@@ -5323,29 +5323,28 @@ export class AcpAgent implements Agent {
 		// Query the config once to check if the model is already settled.
 		// Even the first probe gets its own timeout clamped to the remaining budget.
 		let config: unknown;
-		try {
-			const remaining = deadline - Date.now();
-			if (remaining > 0) {
+		const remaining = deadline - Date.now();
+		if (remaining > 0) {
+			try {
 				const controller = new AbortController();
 				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
 				try {
-					const timeoutPromise = new Promise<never>((_, reject) => {
-						const listener = () => reject(new Error("probe_timeout"));
-						controller.signal.addEventListener("abort", listener);
-					});
+					const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+					const listener = () => rejectTimeout(new Error("probe_timeout"));
+					controller.signal.addEventListener("abort", listener);
 					config = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
 				} finally {
 					clearTimeout(timeoutHandle);
 				}
-			} else {
-				return; // Budget exhausted before first probe.
+			} catch {
+				// Advisory: ignore first probe error and proceed to retry loop.
+				// The first probe's failure doesn't mean the model won't settle later.
+				config = undefined;
 			}
-		} catch {
-			// Advisory: ignore probe error and proceed without the model.
-			return;
 		}
-		const currentModel = configValues(config).get(MODEL_CONFIG_ID);
+		const currentModel = config !== undefined ? configValues(config).get(MODEL_CONFIG_ID) : undefined;
 		if (currentModel !== undefined) return; // Model is settled.
+		if (remaining <= 0) return; // Budget exhausted before entering retry loop.
 
 		// No explicit model and no settled value: the SDK may be applying a default.
 		// Retry with a bounded timeout, where each probe gets its own timeout clamped to the remaining budget.
@@ -5362,17 +5361,16 @@ export class AcpAgent implements Agent {
 				const controller = new AbortController();
 				const timeoutHandle = setTimeout(() => controller.abort(), remaining);
 				try {
-					const timeoutPromise = new Promise<never>((_, reject) => {
-						const listener = () => reject(new Error("probe_timeout"));
-						controller.signal.addEventListener("abort", listener);
-					});
+					const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
+					const listener = () => rejectTimeout(new Error("probe_timeout"));
+					controller.signal.addEventListener("abort", listener);
 					nextConfig = await Promise.race([record.adapter.query("config.list/get"), timeoutPromise]);
 				} finally {
 					clearTimeout(timeoutHandle);
 				}
 			} catch {
-				// Advisory: probe failed or timed out; proceed without waiting further.
-				return;
+				// Advisory: probe failed or timed out; continue retrying while budget remains.
+				continue;
 			}
 			if (configValues(nextConfig).get(MODEL_CONFIG_ID) !== undefined) return; // Settled.
 		}
