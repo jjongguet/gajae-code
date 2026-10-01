@@ -24506,7 +24506,6 @@ export class AgentSession {
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
 				(!firstEventTimeout &&
 					!messageOnlyWatchdogTimeout &&
-					!canReplayCodexProviderOverload &&
 					!canReplayUnexpectedSocketClose &&
 					!this.#hasCleanRetryReplaySafety)
 			) {
