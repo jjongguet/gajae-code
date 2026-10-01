@@ -2,19 +2,19 @@ import { beforeEach, expect, test } from "bun:test";
 import { acpSessionStateFromConfig } from "../../src/modes/acp/acp-agent";
 
 /**
- * Regression test for issue #6009: when no explicit --model is passed,
- * #waitForModelSettle should retry config probes until the model settles.
+ * Regression test for issue #6009: ACP `session/new` must include the model config option
+ * when `modelRoles.default` is configured but no explicit --model is passed.
+ *
+ * The fix adds #waitForModelSettle to retry config probes until the model settles.
  *
  * Unit tests verify acpSessionStateFromConfig behavior:
  * 1. acpSessionStateFromConfig includes the model in configOptions when present
  * 2. acpSessionStateFromConfig excludes the model when absent
  * 3. The response correctly reflects model state transitions
  *
- * Integration tests verify #waitForModelSettle behavior via AcpAgent.newSession:
- * - When adapter.query("config.list/get") returns no model, then error, then model,
- *   the settlement retry logic retries and eventually includes the model in the result.
- * - The final session response contains the model in configOptions.
- * - Removing or disabling the waitForModelSettle call causes tests to fail.
+ * Note: End-to-end testing of #waitForModelSettle requires AcpAgent.newSession
+ * to be called with a mock adapter that simulates model settlement delays.
+ * This is out of scope for the current test suite.
  */
 
 /**
@@ -173,13 +173,3 @@ test("acpSessionStateFromConfig reflects model state transitions", () => {
 	expect(modelAfter).toBeDefined();
 	expect(modelAfter?.currentValue).toBe("anthropic/claude-3-5-sonnet");
 });
-
-/**
- * Note: End-to-end testing of #waitForModelSettle requires AcpAgent.newSession
- * to be called with a mock adapter. This is tested through the full ACP fixture
- * infrastructure in other test files (e.g., acp-cancel-settlement.test.ts) where
- * the WebSocket protocol simulation and query mocking can be set up together.
- *
- * The unit tests here verify acpSessionStateFromConfig correctness, which is
- * a prerequisite for the integration tests to work correctly.
- */
