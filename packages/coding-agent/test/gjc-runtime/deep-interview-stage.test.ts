@@ -1048,6 +1048,8 @@ describe("deep-interview staged transitions", () => {
 		await seed(root);
 		// Simulate the pre-guard poisoned write: an unverifiable contract already
 		// persisted (as happened in the dogfood run before the sanitizer existed).
+		// The contract was from before the intent_contract_required guard was added,
+		// so it would not have this flag set to true.
 		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
 		const current = await readState(root);
 		(current.state as Record<string, unknown>).intent_contract = {
@@ -1055,6 +1057,8 @@ describe("deep-interview staged transitions", () => {
 			status: "confirmed",
 			items: [{ id: "artifact:roadmap", category: "artifact", statement: "roadmap" }],
 		};
+		// Remove the guard flag to simulate the pre-guard state
+		delete (current.state as Record<string, unknown>).intent_contract_required;
 		await fs.writeFile(statePath, `${JSON.stringify(current, null, 2)}\n`, "utf-8");
 		// Any later delta write must succeed, not fail with `invalid intent contract`.
 		const written = parse(
