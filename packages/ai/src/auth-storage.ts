@@ -5557,6 +5557,15 @@ export class AuthStorage {
 		let localDial = false;
 		let refreshLease: OAuthRefreshLease | undefined;
 		let refreshLeaseCompleted = false;
+		let waitedForLease = false;
+		// Only failures observed before this attempt began can block it. A refresh
+		// already waiting on another attempt's lease must remain eligible after
+		// that attempt fails and releases its lease.
+		const initialRefreshFailure =
+			!force && credentialId !== undefined
+				? this.#recentOAuthRefreshFailures.get(`${credentialId}:${credential.refresh}`)
+				: undefined;
+		const initialRefreshToken = credential.refresh;
 		const releaseRefreshLease = (): void => {
 			if (!refreshLease || refreshLeaseCompleted) return;
 			refreshLeaseCompleted = true;
@@ -5571,6 +5580,11 @@ export class AuthStorage {
 				});
 			}
 		};
+
+		function failBeforeRefresh(error: unknown): never {
+			releaseRefreshLease();
+			throw error;
+		}
 
 		// Caller override > store-level hook > local per-provider refresh.
 		// `RemoteAuthCredentialStore` exposes the hook so a broker-backed gateway
@@ -5599,11 +5613,14 @@ export class AuthStorage {
 			if (credentialId !== undefined) {
 				const claimLease = this.#store.claimOAuthRefreshLease?.bind(this.#store);
 				if (claimLease) {
-					const owner = this.#oauthRefreshLeaseOwner;
+					// Keep the instance owner as a prefix for observability, but give
+					// each refresh attempt its own lease owner. A retry must contend
+					// with the prior attempt instead of renewing or releasing it.
+					const owner = `${this.#oauthRefreshLeaseOwner}:${crypto.randomUUID()}`;
 
 					const deadline = Date.now() + OAUTH_REFRESH_LEASE_MS;
 					for (;;) {
-						if (signal?.aborted) throw new Error("OAuth token refresh aborted by caller");
+						if (signal?.aborted) failBeforeRefresh(new Error("OAuth token refresh aborted by caller"));
 						let claim: OAuthRefreshLeaseClaim;
 						try {
 							claim = claimLease(
@@ -5615,14 +5632,26 @@ export class AuthStorage {
 								OAUTH_REFRESH_LEASE_MS,
 							);
 						} catch (error) {
-							releaseRefreshLease();
-							throw error;
+							failBeforeRefresh(error);
 						}
-						if (claim.kind === "missing") throw new Error("OAuth refresh credential disappeared");
+						if (claim.kind === "missing") {
+							failBeforeRefresh(new Error("OAuth refresh credential disappeared"));
+						}
 
 						if (claim.kind === "claimed") {
 							credential = claim.credential;
 							refreshLease = claim.lease;
+							if (
+								initialRefreshFailure &&
+								initialRefreshFailure.expiresAt > Date.now() &&
+								credential.refresh === initialRefreshToken
+							) {
+								failBeforeRefresh(initialRefreshFailure.error);
+							}
+							if (!waitedForLease && !force && credentialId !== undefined) {
+								const memo = this.#recentOAuthRefreshFailures.get(`${credentialId}:${credential.refresh}`);
+								if (memo && memo.expiresAt > Date.now()) failBeforeRefresh(memo.error);
+							}
 							break;
 						}
 						if (claim.kind === "adopted") {
@@ -5641,6 +5670,7 @@ export class AuthStorage {
 						if (Date.now() >= deadline) {
 							throw new Error("OAuth token refresh ownership remained ambiguous");
 						}
+						waitedForLease = true;
 						await Bun.sleep(Math.min(50, Math.max(1, claim.expiresAt - Date.now())));
 					}
 				} else {
@@ -5655,21 +5685,11 @@ export class AuthStorage {
 					}
 				}
 			}
-			// Replay guard: an attempt with this exact (id, token) pair failed
-			// moments ago. The provider may have consumed the rotating token even
-			// though we saw a failure (timeout, lost response), so replaying it
-			// risks reuse-detection revocation. Surface the memoized failure
-			// instead of dialing again; a peer's successful rotation changes the
-			// token and therefore never hits this memo. Explicit force refreshes
-			// bypass the check (a deliberate operator/broker retry must reach the
-			// endpoint) but their failures are still recorded below.
-			if (!force && credentialId !== undefined) {
-				const memoKey = `${credentialId}:${credential.refresh}`;
-				const memo = this.#recentOAuthRefreshFailures.get(memoKey);
-				if (memo && memo.expiresAt > Date.now()) {
-					releaseRefreshLease();
-					throw memo.error;
-				}
+			// Replay guard: only a failure that predated this attempt can block it.
+			// A failure created while this attempt waited for another lease must not
+			// discard the eventual successful refresh.
+			if (!refreshLease && initialRefreshFailure && initialRefreshFailure.expiresAt > Date.now()) {
+				failBeforeRefresh(initialRefreshFailure.error);
 			}
 			localDial = true;
 			// Re-check the binding AFTER adoption: a persisted row may have
@@ -5790,6 +5810,7 @@ export class AuthStorage {
 		} finally {
 			if (timeout) clearTimeout(timeout);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+			releaseRefreshLease();
 		}
 	}
 

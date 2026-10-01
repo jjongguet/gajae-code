@@ -13,6 +13,7 @@ import {
 	SqliteAuthCredentialStore,
 } from "../src/auth-storage";
 import * as oauthUtils from "../src/utils/oauth";
+import type { OAuthCredentials } from "../src/utils/oauth/types";
 import { withEnv } from "./helpers";
 
 const SUPPRESS_ANTHROPIC_ENV = {
@@ -375,7 +376,7 @@ describe("AuthStorage OAuth refresh race", () => {
 			async login() {
 				return { access: "unused", refresh: "unused", expires: refreshedExpires };
 			},
-			async refreshToken(credentials) {
+			async refreshToken(credentials: OAuthCredentials) {
 				return {
 					...credentials,
 					access: `${credentials.access}-rotated`,
@@ -383,7 +384,7 @@ describe("AuthStorage OAuth refresh race", () => {
 					expires: refreshedExpires,
 				};
 			},
-			getApiKey(credentials) {
+			getApiKey(credentials: OAuthCredentials) {
 				return credentials.access;
 			},
 		});
@@ -418,7 +419,7 @@ describe("AuthStorage OAuth refresh race", () => {
 			async login() {
 				return { access: "unused", refresh: "unused", expires: refreshedExpires };
 			},
-			async refreshToken(credentials) {
+			async refreshToken(credentials: OAuthCredentials) {
 				refreshCalls += 1;
 				refreshStarted.resolve();
 				await allowRefresh.promise;
@@ -429,7 +430,7 @@ describe("AuthStorage OAuth refresh race", () => {
 					expires: refreshedExpires,
 				};
 			},
-			getApiKey(credentials) {
+			getApiKey(credentials: OAuthCredentials) {
 				return credentials.access;
 			},
 		});
@@ -477,7 +478,7 @@ describe("AuthStorage OAuth refresh race", () => {
 						expires: Date.now() + 60 * 60_000,
 					};
 				},
-				getApiKey(credentials) {
+				getApiKey(credentials: OAuthCredentials) {
 					return credentials.access;
 				},
 			});
@@ -1212,6 +1213,97 @@ describe("AuthStorage OAuth refresh race", () => {
 		}
 	});
 
+	for (const failure of ["abort", "network", "timeout"] as const) {
+		test(`a ${failure} in a forced MCP refresh does not poison a waiting automatic refresh`, async () => {
+			if (!authStorage || !store) throw new Error("test setup failed");
+			const firstRequest = Promise.withResolvers<void>();
+			const releaseFirstRequest = Promise.withResolvers<void>();
+			let requestCount = 0;
+			const server = Bun.serve({
+				port: 0,
+				fetch: async () => {
+					requestCount += 1;
+					if (requestCount === 1) {
+						firstRequest.resolve();
+						await releaseFirstRequest.promise;
+						if (failure === "network") return new Response("network failure", { status: 500 });
+						return new Response("late failure", { status: 500 });
+					}
+					return Response.json({
+						access_token: "automatic-access",
+						refresh_token: "automatic-refresh",
+						expires_in: 3600,
+					});
+				},
+			});
+			const controller = new AbortController();
+			const originalSetTimeout = globalThis.setTimeout;
+			if (failure === "timeout") {
+				vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+					handler: () => void,
+					delay?: number,
+					...args: unknown[]
+				) => {
+					if (delay === 10_000) return originalSetTimeout(handler, 0);
+					return originalSetTimeout(handler, delay, ...args);
+				}) as typeof setTimeout);
+			}
+			try {
+				const origin = `http://localhost:${server.port}`;
+				await authStorage.set("anthropic", [
+					{
+						type: "oauth",
+						access: "expired-access",
+						refresh: "initial-refresh",
+						expires: Date.now() - 60_000,
+						mcpBinding: { resourceOrigin: origin, tokenEndpoint: `${origin}/token` },
+					},
+				]);
+				const row = store.listAuthCredentials("anthropic")[0];
+				if (!row) throw new Error("expected OAuth credential");
+				vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+					const credential = credentials[provider];
+					if (!credential) return null;
+					return { newCredentials: credential, apiKey: credential.access };
+				});
+
+				const forced = authStorage.refreshCredentialById(row.id, controller.signal).then(
+					value => ({ value, error: undefined }),
+					error => ({ value: undefined, error }),
+				);
+				await firstRequest.promise;
+				const automaticResult = Promise.withResolvers<string | undefined>();
+				const automatic = withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+					automaticResult.resolve(await authStorage!.getApiKey("anthropic", "automatic-refresh"));
+				});
+				if (failure === "abort") controller.abort();
+				if (failure === "network") releaseFirstRequest.resolve();
+				const forcedOutcome = await forced;
+				if (failure === "abort") expect(forcedOutcome.error).toBeInstanceOf(Error);
+				if (failure === "network") expect(forcedOutcome.error).toBeInstanceOf(Error);
+				if (failure === "timeout")
+					expect(forcedOutcome.error).toMatchObject({ message: expect.stringMatching(/timed out/) });
+				await automatic;
+				expect(await automaticResult.promise).toBe("automatic-access");
+
+				const persisted = store.listAuthCredentials("anthropic")[0]?.credential;
+				expect(persisted).toMatchObject({
+					type: "oauth",
+					access: "automatic-access",
+					refresh: "automatic-refresh",
+				});
+				expect(authStorage.getEarliestUnblockAt("anthropic")).toBeUndefined();
+				await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+					expect(await authStorage!.getApiKey("anthropic", "after-race")).toBe("automatic-access");
+				});
+			} finally {
+				releaseFirstRequest.resolve();
+				server.stop(true);
+				vi.restoreAllMocks();
+			}
+		});
+	}
+
 	test("an adopted token's definitive failure disables the row instead of looping, even for frozen errors", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 
@@ -1448,6 +1540,393 @@ describe("AuthStorage OAuth refresh race", () => {
 		});
 	});
 
+	test("releases a failed refresh lease for peer processes", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const peer = new AuthStorage(peerStore);
+		try {
+			const provider = "unit-oauth-lease-release";
+			let refreshCalls = 0;
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Lease Release",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken() {
+					refreshCalls += 1;
+					throw new Error("refresh failed");
+				},
+				getApiKey(credentials: OAuthCredentials) {
+					return credentials.access;
+				},
+			});
+
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			await peer.reload();
+			const row = store.listAuthCredentials(provider)[0];
+			if (!row) throw new Error("expected OAuth credential");
+
+			await expect(authStorage.refreshCredentialById(row.id)).rejects.toThrow("refresh failed");
+			expect(refreshCalls).toBe(1);
+
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"lease-release-test-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") {
+				peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+			}
+
+			const peerRefreshStarted = performance.now();
+			await expect(peer.refreshCredentialById(row.id)).rejects.toThrow("refresh failed");
+			expect(performance.now() - peerRefreshStarted).toBeLessThan(1_000);
+			expect(refreshCalls).toBe(2);
+		} finally {
+			peerStore.close();
+		}
+	});
+
+	test("preserves the custom OAuth provider receiver during refresh", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const provider = {
+			id: "unit-oauth-receiver",
+			name: "Unit OAuth Receiver",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			prefix: "receiver-preserved",
+			async login() {
+				throw new Error("Unexpected login");
+			},
+			async refreshToken(credentials: OAuthCredentials) {
+				return {
+					...credentials,
+					access: `${this.prefix}-access`,
+					refresh: `${this.prefix}-refresh`,
+					expires: Date.now() + 60 * 60_000,
+				};
+			},
+			getApiKey(credentials: OAuthCredentials) {
+				return credentials.access;
+			},
+		};
+		oauthUtils.registerOAuthProvider(provider);
+
+		await authStorage.set(provider.id, {
+			type: "oauth",
+			access: "access-before",
+			refresh: "refresh-before",
+			expires: Date.now() - 60_000,
+		});
+		const row = store.listAuthCredentials(provider.id)[0];
+		if (!row) throw new Error("expected OAuth credential");
+
+		const entry = await authStorage.refreshCredentialById(row.id);
+		expect(entry.credential).toMatchObject({
+			type: "oauth",
+			access: "receiver-preserved-access",
+		});
+		expect(store.listAuthCredentials(provider.id)[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "receiver-preserved-access",
+		});
+	});
+
+	test("releases the lease when a custom provider cannot refresh", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		try {
+			const provider = {
+				id: "unit-oauth-no-refresh",
+				name: "Unit OAuth Without Refresh",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				getApiKey(credentials: OAuthCredentials) {
+					return credentials.access;
+				},
+			};
+			oauthUtils.registerOAuthProvider(provider);
+			await authStorage.set(provider.id, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const row = store.listAuthCredentials(provider.id)[0];
+			if (!row) throw new Error("expected OAuth credential");
+
+			await expect(authStorage.refreshCredentialById(row.id)).rejects.toThrow(
+				`OAuth provider "${provider.id}" does not support token refresh`,
+			);
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"no-refresh-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+		} finally {
+			peerStore.close();
+		}
+	});
+
+	test("releases the lease when the caller aborts during refresh", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const refreshStarted = Promise.withResolvers<void>();
+		const leaseReleased = Promise.withResolvers<void>();
+		const allowRefresh = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		try {
+			const releaseOAuthRefreshLease = store.releaseOAuthRefreshLease;
+			if (!releaseOAuthRefreshLease) throw new Error("test store cannot release OAuth leases");
+			const releaseLease = releaseOAuthRefreshLease.bind(store);
+			vi.spyOn(store, "releaseOAuthRefreshLease").mockImplementation(lease => {
+				releaseLease(lease);
+				leaseReleased.resolve();
+			});
+			const provider = "unit-oauth-lease-abort";
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Lease Abort",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken() {
+					refreshStarted.resolve();
+					await allowRefresh.promise;
+					throw new Error("refresh failed after caller abort");
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const row = store.listAuthCredentials(provider)[0];
+			if (!row) throw new Error("expected OAuth credential");
+
+			const refresh = authStorage.refreshCredentialById(row.id, controller.signal);
+			await refreshStarted.promise;
+			controller.abort();
+			await expect(refresh).rejects.toThrow("credential refresh aborted");
+			allowRefresh.resolve();
+			await leaseReleased.promise;
+
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"abort-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+		} finally {
+			allowRefresh.resolve();
+			peerStore.close();
+		}
+	});
+
+	test("releases the lease when the refresh times out", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const refreshStarted = Promise.withResolvers<void>();
+		const leaseReleased = Promise.withResolvers<void>();
+		const allowRefresh = Promise.withResolvers<void>();
+		try {
+			const releaseOAuthRefreshLease = store.releaseOAuthRefreshLease;
+			if (!releaseOAuthRefreshLease) throw new Error("test store cannot release OAuth leases");
+			const releaseLease = releaseOAuthRefreshLease.bind(store);
+			vi.spyOn(store, "releaseOAuthRefreshLease").mockImplementation(lease => {
+				releaseLease(lease);
+				leaseReleased.resolve();
+			});
+			// DEFAULT_OAUTH_REFRESH_TIMEOUT_MS is not exported; fire that specific
+			// delay immediately so the test doesn't wait 10s, while leaving every
+			// other setTimeout call (e.g. internal retry/backoff timers) unaffected.
+			const originalSetTimeout = globalThis.setTimeout;
+			vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+				handler: () => void,
+				delay?: number,
+				...args: unknown[]
+			) => {
+				if (delay === 10_000) return originalSetTimeout(handler, 0);
+				return originalSetTimeout(handler, delay, ...args);
+			}) as typeof setTimeout);
+
+			const provider = "unit-oauth-lease-timeout";
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Lease Timeout",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken() {
+					refreshStarted.resolve();
+					await allowRefresh.promise;
+					throw new Error("refresh failed after timeout");
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const row = store.listAuthCredentials(provider)[0];
+			if (!row) throw new Error("expected OAuth credential");
+
+			const refresh = authStorage.refreshCredentialById(row.id);
+			await refreshStarted.promise;
+			await expect(refresh).rejects.toThrow(/timed out/);
+			allowRefresh.resolve();
+			await leaseReleased.promise;
+
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"timeout-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+		} finally {
+			allowRefresh.resolve();
+			vi.restoreAllMocks();
+			peerStore.close();
+		}
+	});
+
+	test("releases the lease when atomic refresh persistence loses ownership", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		try {
+			const provider = "unit-oauth-lease-ownership-lost";
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Ownership Lost",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken(credentials) {
+					return {
+						...credentials,
+						access: "refreshed-access",
+						refresh: "refreshed-refresh",
+						expires: Date.now() + 60 * 60_000,
+					};
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const row = store.listAuthCredentials(provider)[0];
+			if (!row) throw new Error("expected OAuth credential");
+			vi.spyOn(store, "completeOAuthRefreshLease").mockReturnValue(false);
+
+			await expect(authStorage.refreshCredentialById(row.id)).rejects.toThrow(
+				"OAuth token refresh ownership was lost before persistence",
+			);
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"ownership-lost-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+		} finally {
+			peerStore.close();
+		}
+	});
+
+	test("releases the lease when a recent refresh failure memo is reused", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		try {
+			const provider = "unit-oauth-lease-memo";
+			let refreshCalls = 0;
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Unit OAuth Lease Memo",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Unexpected login");
+				},
+				async refreshToken() {
+					refreshCalls += 1;
+					throw new Error("memoized refresh failure");
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			await authStorage.set(provider, {
+				type: "oauth",
+				access: "access-before",
+				refresh: "refresh-before",
+				expires: Date.now() - 60_000,
+			});
+			const row = store.listAuthCredentials(provider)[0];
+			if (!row) throw new Error("expected OAuth credential");
+
+			await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				await expect(authStorage!.getApiKey(provider, "memoized-failure")).resolves.toBeUndefined();
+			});
+			expect(refreshCalls).toBe(1);
+			const peerClaim = peerStore.claimOAuthRefreshLease(
+				row.id,
+				"refresh-before",
+				false,
+				"memo-peer",
+				Date.now(),
+				15_000,
+			);
+			expect(peerClaim.kind).toBe("claimed");
+			if (peerClaim.kind === "claimed") peerStore.releaseOAuthRefreshLease(peerClaim.lease);
+		} finally {
+			peerStore.close();
+		}
+	});
+
 	test("leases one rotating token across SQLite connections and adopts the winner", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
@@ -1489,6 +1968,109 @@ describe("AuthStorage OAuth refresh race", () => {
 			});
 		} finally {
 			peerStore.close();
+		}
+	});
+
+	test("a late lease release cannot erase a newer completed refresh", async () => {
+		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
+		const sqliteStore = store;
+		await authStorage.set("anthropic", [
+			{ type: "oauth", access: "old-access", refresh: "old-refresh", expires: Date.now() - 60_000 },
+		]);
+		const row = store.listAuthCredentials("anthropic")[0];
+		if (!row) throw new Error("expected OAuth credential");
+		const now = Date.now();
+		const first = store.claimOAuthRefreshLease(row.id, "old-refresh", false, "attempt-a", now, 1);
+		expect(first.kind).toBe("claimed");
+		if (first.kind !== "claimed") return;
+		await Bun.sleep(10);
+		const second = store.claimOAuthRefreshLease(row.id, "old-refresh", false, "attempt-b", Date.now(), 15_000);
+		expect(second.kind).toBe("claimed");
+		if (second.kind !== "claimed") return;
+		expect(second.lease.owner).not.toBe(first.lease.owner);
+		expect(
+			store.completeOAuthRefreshLease(second.lease, {
+				type: "oauth",
+				access: "new-access",
+				refresh: "new-refresh",
+				expires: Date.now() + 60 * 60_000,
+			}),
+		).toBe(true);
+
+		// This is the late failure/cleanup path from attempt A. It must be owner-CAS
+		// scoped and leave B's already persisted authority untouched.
+		expect(() => sqliteStore.releaseOAuthRefreshLease(first.lease)).not.toThrow();
+		expect(sqliteStore.listAuthCredentials("anthropic")[0]?.credential).toMatchObject({
+			type: "oauth",
+			access: "new-access",
+			refresh: "new-refresh",
+		});
+	});
+
+	test("same-instance refresh attempts use distinct lease owners while the second waits", async () => {
+		if (!authStorage || !(store instanceof SqliteAuthCredentialStore)) throw new Error("test setup failed");
+		const firstRequest = Promise.withResolvers<void>();
+		const releaseFirstRequest = Promise.withResolvers<void>();
+		let requestCount = 0;
+		const owners: string[] = [];
+		const originalClaim = store.claimOAuthRefreshLease.bind(store);
+		vi.spyOn(store, "claimOAuthRefreshLease").mockImplementation(
+			(credentialId, expectedRefresh, force, owner, nowMs, leaseMs) => {
+				owners.push(owner);
+				return originalClaim(credentialId, expectedRefresh, force, owner, nowMs, leaseMs);
+			},
+		);
+		const server = Bun.serve({
+			port: 0,
+			fetch: async () => {
+				requestCount += 1;
+				if (requestCount === 1) {
+					firstRequest.resolve();
+					await releaseFirstRequest.promise;
+				}
+				return Response.json({
+					access_token: "owner-check-access",
+					refresh_token: "owner-check-refresh",
+					expires_in: 3600,
+				});
+			},
+		});
+		try {
+			const origin = `http://localhost:${server.port}`;
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "expired-access",
+					refresh: "owner-check-old-refresh",
+					expires: Date.now() - 60_000,
+					mcpBinding: { resourceOrigin: origin, tokenEndpoint: `${origin}/token` },
+				},
+			]);
+			const row = store.listAuthCredentials("anthropic")[0];
+			if (!row) throw new Error("expected OAuth credential");
+			vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+				const credential = credentials[provider];
+				return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+			});
+			const controller = new AbortController();
+			const forced = authStorage.refreshCredentialById(row.id, controller.signal);
+			await firstRequest.promise;
+			const automaticResult = Promise.withResolvers<string | undefined>();
+			const automatic = withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+				automaticResult.resolve(await authStorage!.getApiKey("anthropic", "owner-check"));
+			});
+			await Bun.sleep(100);
+			expect(owners.length).toBeGreaterThanOrEqual(2);
+			expect(new Set(owners).size).toBeGreaterThanOrEqual(2);
+			controller.abort();
+			releaseFirstRequest.resolve();
+			await expect(forced).rejects.toThrow("credential refresh aborted");
+			await automatic;
+			await expect(automaticResult.promise).resolves.toBe("owner-check-access");
+			await Bun.sleep(50);
+		} finally {
+			releaseFirstRequest.resolve();
+			server.stop(true);
 		}
 	});
 
