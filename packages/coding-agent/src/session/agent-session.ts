@@ -127,6 +127,7 @@ import {
 	streamSimple,
 } from "@gajae-code/ai/core";
 import { normalizeAnthropicBaseUrl } from "@gajae-code/ai/providers/anthropic";
+import { isExplicitCodexTerminalVeto } from "@gajae-code/ai/providers/openai-codex-responses";
 import {
 	type AuthDisposition,
 	beginAttempt,
@@ -1557,6 +1558,7 @@ function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
+		!isExplicitCodexTerminalVeto(undefined, message.errorMessage) &&
 		(isExactTypedOverloadFacts(message, BARE_DEFAULT_OVERLOAD_CODES) ||
 			(BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
 				!hasBareDefaultRetryDisqualifyingFacts(message))) &&
@@ -1567,6 +1569,7 @@ function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 function isBareDefaultCodexProviderFailure(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
+		!isExplicitCodexTerminalVeto(message.transportFailure?.providerCode, message.errorMessage) &&
 		(isExactTypedOverloadFacts(message, BARE_DEFAULT_CODEX_RETRYABLE_CODES) ||
 			(BARE_DEFAULT_CODEX_RETRYABLE_ERROR.test(message.errorMessage ?? "") &&
 				!hasBareDefaultRetryDisqualifyingFacts(message))) &&

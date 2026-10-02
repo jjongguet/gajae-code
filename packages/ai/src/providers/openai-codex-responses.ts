@@ -2151,7 +2151,8 @@ async function handleCodexStreamFailure(
 	output.errorStatus = extractHttpStatusFromError(error);
 	const transportFailure = transportFailureFacts(error);
 	const codexError = error instanceof CodexProviderStreamError ? error : undefined;
-	const explicitTerminalVeto = codexError !== undefined && isExplicitCodexTerminalVeto(codexError);
+	const explicitTerminalVeto =
+		codexError !== undefined && isExplicitCodexTerminalVeto(codexError.code, codexError.providerMessage);
 	const typedProviderCode =
 		codexError !== undefined && CODEX_TYPED_TRANSPORT_PROVIDER_CODES.has(codexError.code ?? "")
 			? codexError.code
@@ -3315,10 +3316,10 @@ function isRetryableCodexFailureEvent(rawEvent: Record<string, unknown>): boolea
 	return !!message && CODEX_RETRYABLE_EVENT_MESSAGE.test(message);
 }
 
-function isExplicitCodexTerminalVeto(error: CodexProviderStreamError): boolean {
+export function isExplicitCodexTerminalVeto(code?: string, providerMessage?: string): boolean {
 	return (
-		CODEX_EXPLICIT_TERMINAL_VETO_CODES.has(error.code?.toLowerCase() ?? "") ||
-		CODEX_NON_RETRYABLE_EVENT_MESSAGE.test(error.providerMessage)
+		CODEX_EXPLICIT_TERMINAL_VETO_CODES.has(code?.toLowerCase() ?? "") ||
+		CODEX_NON_RETRYABLE_EVENT_MESSAGE.test(providerMessage ?? "")
 	);
 }
 
