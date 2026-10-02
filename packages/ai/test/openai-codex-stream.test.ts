@@ -176,9 +176,9 @@ class MockWebSocket {
 	constructor(
 		public readonly url: string,
 		public readonly options?: { headers?: WsHeaders },
-	) {}
+	) { }
 
-	send(_data: string): void {}
+	send(_data: string): void { }
 
 	close(): void {
 		this.readyState = MockWebSocket.CLOSED;
@@ -733,13 +733,13 @@ describe("openai-codex streaming", () => {
 				},
 				...(streamedDelta
 					? [
-							{
-								type: "response.reasoning_summary_text.delta",
-								item_id: "reasoning_1",
-								output_index: 0,
-								delta: streamedDelta,
-							},
-						]
+						{
+							type: "response.reasoning_summary_text.delta",
+							item_id: "reasoning_1",
+							output_index: 0,
+							delta: streamedDelta,
+						},
+					]
 					: []),
 				{ type: "response.reasoning_summary_part.done", item_id: "reasoning_1", output_index: 0 },
 				{
@@ -1130,6 +1130,30 @@ describe("openai-codex streaming", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain(`code=${code}`);
 		expect(result.transportFailure).toMatchObject({ kind: "transport", providerCode: code });
+		expect(result.transportFailure?.retryMaxAttempts).toBeUndefined();
+	});
+
+	it("preserves a code-only Codex overload as retryable transport facts", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-provider-overload-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		const sse = `data: ${JSON.stringify({ type: "error", code: "server_is_overloaded" })}\n\n`;
+		global.fetch = vi.fn(
+			async () => new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		) as unknown as typeof fetch;
+
+		const result = await streamOpenAICodexResponses(model, createCodexTestContext(), {
+			apiKey: token,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "server_is_overloaded",
+		});
+		expect(result.transportFailure?.retryMaxAttempts).toBeUndefined();
 	});
 
 	it("stops reading SSE responses after a terminal response event", async () => {
@@ -1369,6 +1393,7 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("invalid_function_parameters");
+		expect(result.transportFailure).toBeUndefined();
 	});
 
 	it("honors streamMaxRetries for replay-safe Codex stream failures", async () => {
@@ -4009,7 +4034,7 @@ describe("openai-codex streaming", () => {
 				.mockResolvedValue(
 					new Response(
 						`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}\n\n` +
-							createCompletedCodexSse("Recovered from SSE"),
+						createCompletedCodexSse("Recovered from SSE"),
 						{ headers: { "content-type": "text/event-stream" } },
 					),
 				);
@@ -4422,7 +4447,7 @@ describe("openai-codex streaming", () => {
 		}
 		global.WebSocket = StalledToolCallWebSocket as unknown as typeof WebSocket;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(new ReadableStream({ start() {} }), {
+			new Response(new ReadableStream({ start() { } }), {
 				status: 200,
 				headers: { "content-type": "text/event-stream" },
 			}),
@@ -4479,7 +4504,7 @@ describe("openai-codex streaming", () => {
 		}
 		global.WebSocket = SilentTodoWebSocket as unknown as typeof WebSocket;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(new ReadableStream({ start() {} }), {
+			new Response(new ReadableStream({ start() { } }), {
 				status: 200,
 				headers: { "content-type": "text/event-stream" },
 			}),
