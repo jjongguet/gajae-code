@@ -24371,6 +24371,7 @@ export class AgentSession {
 			isBareDefaultAnthropicOverload(message) ||
 			isBareDefaultOpenAIResponsesOverload(message);
 		const canReplayBareDefaultCodexFailure = isBareDefaultCodexProviderFailure(message);
+		const boundBareDefaultCodexFailure = canReplayBareDefaultCodexFailure && !legacyRetryConfigured;
 		const canReplayCodexProviderOverload = isBareDefaultCodexOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
@@ -24539,7 +24540,7 @@ export class AgentSession {
 			!managedFallback &&
 			classification === "transient" &&
 			!canReplayProviderOverload &&
-			!canReplayBareDefaultCodexFailure &&
+			!boundBareDefaultCodexFailure &&
 			!canReplayUnexpectedSocketClose &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 
