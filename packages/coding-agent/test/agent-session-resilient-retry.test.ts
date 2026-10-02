@@ -1561,7 +1561,10 @@ describe.serial("AgentSession resilient retry", () => {
 		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 	});
-	it("does not advance managed Codex fallback after a schema veto", async () => {
+	it.each([
+		"server_error",
+		"internal_error",
+	])("does not advance managed Codex fallback after a schema veto (%s)", async code => {
 		const primaryBundled = getBundledModel("openai-codex", "gpt-5.5");
 		const fallbackBundled = getBundledModel("openai-codex", "gpt-5.4-mini");
 		if (!primaryBundled || !fallbackBundled) throw new Error("Expected bundled Codex test models to exist");
@@ -1593,7 +1596,7 @@ describe.serial("AgentSession resilient retry", () => {
 		);
 		const errorSse = `data: ${JSON.stringify({
 			type: "error",
-			code: "server_error",
+			code,
 			message:
 				"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
 		})}\n\n`;
@@ -1604,7 +1607,7 @@ describe.serial("AgentSession resilient retry", () => {
 				})) as unknown as typeof fetch,
 		);
 
-		await session.prompt("surface managed Codex schema veto");
+		await session.prompt(`surface managed Codex ${code} schema veto`);
 		await session.waitForIdle();
 
 		expect(streamCalls.get(primary.id)).toBe(1);
@@ -1614,7 +1617,10 @@ describe.serial("AgentSession resilient retry", () => {
 		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 	});
-	it("surfaces Codex schema validation veto without a session replay", async () => {
+	it.each([
+		"server_error",
+		"internal_error",
+	])("surfaces Codex schema validation veto without a session replay (%s)", async code => {
 		const bundled = getBundledModel("openai-codex", "gpt-5.5");
 		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
 		const model: Model<"openai-codex-responses"> = {
@@ -1640,7 +1646,7 @@ describe.serial("AgentSession resilient retry", () => {
 			{ type: "response.created", response: { id: "r1", status: "in_progress", output: [] } },
 			{
 				type: "error",
-				code: "server_error",
+				code,
 				message:
 					"Invalid schema for function 'computer': schema must have type 'object' and not have 'oneOf' at the top level. (code=invalid_function_parameters)",
 			},
@@ -1653,13 +1659,57 @@ describe.serial("AgentSession resilient retry", () => {
 		}) as unknown as typeof fetch);
 		const { retryStartEvents } = track(session);
 
-		await session.prompt("surface Codex schema validation");
+		await session.prompt(`surface Codex ${code} schema validation`);
 		await session.waitForIdle();
 
 		expect(retryStartEvents).toHaveLength(0);
 		expect(requests).toBe(1);
 		expect(lastAssistant(session)).toMatchObject({ stopReason: "error" });
 		expect(lastAssistant(session).errorMessage).toContain("invalid_function_parameters");
+		await disposeAfterCoordinatorPersistence(session);
+		session = undefined;
+	});
+	it.each([
+		"server_error",
+		"internal_error",
+	])("does not retry Codex schema veto with configured retry settings (%s)", async code => {
+		const bundled = getBundledModel("openai-codex", "gpt-5.5");
+		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+		const model: Model<"openai-codex-responses"> = { ...bundled, api: "openai-codex-responses" };
+		authStorage.setRuntimeApiKey(model.provider, "fake-key");
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxRetries": 1,
+			"retry.streamMaxRetries": 0,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) =>
+				streamOpenAICodexResponses({ ...model, id: requestedModel.id }, context, options ?? {}),
+		});
+		session = configureRetryTestSession(
+			new AgentSession({ agent, sessionManager: createRetryTestSessionManager(), settings, modelRegistry }),
+		);
+		let requests = 0;
+		const veto = `data: ${JSON.stringify({
+			type: "error",
+			code,
+			message:
+				"Invalid schema for function 'computer': schema must have type 'object'. (code=invalid_function_parameters)",
+		})}\n\n`;
+		vi.spyOn(globalThis, "fetch").mockImplementation((async () => {
+			requests++;
+			return new Response(veto, { headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof fetch);
+		const { retryStartEvents } = track(session);
+
+		await session.prompt(`surface configured Codex ${code} schema veto`);
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(0);
+		expect(requests).toBe(1);
 		await disposeAfterCoordinatorPersistence(session);
 		session = undefined;
 	});
