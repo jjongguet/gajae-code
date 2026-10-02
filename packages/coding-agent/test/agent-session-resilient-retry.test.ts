@@ -1509,8 +1509,9 @@ describe.serial("AgentSession resilient retry", () => {
 		session = undefined;
 	});
 	it("retries a code-only real Codex overload under bare defaults", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.5");
-		if (!model) throw new Error("Expected bundled Codex test model to exist");
+		const bundled = getBundledModel("openai-codex", "gpt-5.5");
+		if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+		const model: Model<"openai-codex-responses"> = { ...bundled, api: "openai-codex-responses" };
 		authStorage.setRuntimeApiKey(model.provider, "fake-key");
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
@@ -1553,9 +1554,11 @@ describe.serial("AgentSession resilient retry", () => {
 		session = undefined;
 	});
 	it("does not advance managed Codex fallback after a schema veto", async () => {
-		const primary = getBundledModel("openai-codex", "gpt-5.5");
-		const fallback = getBundledModel("openai-codex", "gpt-5.4-mini");
-		if (!primary || !fallback) throw new Error("Expected bundled Codex test models to exist");
+		const primaryBundled = getBundledModel("openai-codex", "gpt-5.5");
+		const fallbackBundled = getBundledModel("openai-codex", "gpt-5.4-mini");
+		if (!primaryBundled || !fallbackBundled) throw new Error("Expected bundled Codex test models to exist");
+		const primary: Model<"openai-codex-responses"> = { ...primaryBundled, api: "openai-codex-responses" };
+		const fallback: Model<"openai-codex-responses"> = { ...fallbackBundled, api: "openai-codex-responses" };
 		authStorage.setRuntimeApiKey(primary.provider, "fake-key");
 		const settings = Settings.isolated({ "compaction.enabled": false, "fallback.maxAttempts": 2 });
 		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
@@ -1565,7 +1568,11 @@ describe.serial("AgentSession resilient retry", () => {
 			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (requestedModel, context, options) => {
 				streamCalls.set(requestedModel.id, (streamCalls.get(requestedModel.id) ?? 0) + 1);
-				return streamOpenAICodexResponses({ ...requestedModel, preferWebsockets: false }, context, options ?? {});
+				return streamOpenAICodexResponses(
+					{ ...requestedModel, api: "openai-codex-responses", preferWebsockets: false },
+					context,
+					options ?? {},
+				);
 			},
 		});
 		session = configureRetryTestSession(
@@ -1651,8 +1658,9 @@ describe.serial("AgentSession resilient retry", () => {
 	it.each(["server_error", "internal_error"])(
 		"preserves configured legacy retries for content-free Codex %s",
 		async code => {
-			const model = getBundledModel("openai-codex", "gpt-5.5");
-			if (!model) throw new Error("Expected bundled Codex test model to exist");
+			const bundled = getBundledModel("openai-codex", "gpt-5.5");
+			if (!bundled) throw new Error("Expected bundled Codex test model to exist");
+			const model: Model<"openai-codex-responses"> = { ...bundled, api: "openai-codex-responses" };
 			authStorage.setRuntimeApiKey(model.provider, "fake-key");
 			const settings = Settings.isolated({
 				"compaction.enabled": false,
