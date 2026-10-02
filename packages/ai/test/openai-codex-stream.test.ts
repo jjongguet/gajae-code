@@ -176,9 +176,9 @@ class MockWebSocket {
 	constructor(
 		public readonly url: string,
 		public readonly options?: { headers?: WsHeaders },
-	) { }
+	) {}
 
-	send(_data: string): void { }
+	send(_data: string): void {}
 
 	close(): void {
 		this.readyState = MockWebSocket.CLOSED;
@@ -733,13 +733,13 @@ describe("openai-codex streaming", () => {
 				},
 				...(streamedDelta
 					? [
-						{
-							type: "response.reasoning_summary_text.delta",
-							item_id: "reasoning_1",
-							output_index: 0,
-							delta: streamedDelta,
-						},
-					]
+							{
+								type: "response.reasoning_summary_text.delta",
+								item_id: "reasoning_1",
+								output_index: 0,
+								delta: streamedDelta,
+							},
+						]
 					: []),
 				{ type: "response.reasoning_summary_part.done", item_id: "reasoning_1", output_index: 0 },
 				{
@@ -4034,7 +4034,7 @@ describe("openai-codex streaming", () => {
 				.mockResolvedValue(
 					new Response(
 						`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } })}\n\n` +
-						createCompletedCodexSse("Recovered from SSE"),
+							createCompletedCodexSse("Recovered from SSE"),
 						{ headers: { "content-type": "text/event-stream" } },
 					),
 				);
@@ -4447,7 +4447,7 @@ describe("openai-codex streaming", () => {
 		}
 		global.WebSocket = StalledToolCallWebSocket as unknown as typeof WebSocket;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(new ReadableStream({ start() { } }), {
+			new Response(new ReadableStream({ start() {} }), {
 				status: 200,
 				headers: { "content-type": "text/event-stream" },
 			}),
@@ -4504,7 +4504,7 @@ describe("openai-codex streaming", () => {
 		}
 		global.WebSocket = SilentTodoWebSocket as unknown as typeof WebSocket;
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-			new Response(new ReadableStream({ start() { } }), {
+			new Response(new ReadableStream({ start() {} }), {
 				status: 200,
 				headers: { "content-type": "text/event-stream" },
 			}),
