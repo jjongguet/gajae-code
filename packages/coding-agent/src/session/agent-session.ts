@@ -1555,9 +1555,24 @@ function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined
 	);
 }
 
+// Deterministic auth/request/model diagnostics must surface even when a provider
+// labels the failure with a transient code.
+const TERMINAL_ERROR_MESSAGE =
+	/unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i;
+
+function isTerminalCodexProviderFailure(message: AssistantMessage): boolean {
+	return (
+		message.api === "openai-codex-responses" &&
+		(BARE_DEFAULT_CODEX_RETRYABLE_CODES.has(message.transportFailure?.providerCode ?? "") ||
+			BARE_DEFAULT_CODEX_RETRYABLE_ERROR.test(message.errorMessage ?? "")) &&
+		TERMINAL_ERROR_MESSAGE.test(message.errorMessage ?? "")
+	);
+}
+
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
+		!TERMINAL_ERROR_MESSAGE.test(message.errorMessage ?? "") &&
 		!isExplicitCodexTerminalVeto(undefined, message.errorMessage) &&
 		(isExactTypedOverloadFacts(message, BARE_DEFAULT_OVERLOAD_CODES) ||
 			(BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
@@ -1569,6 +1584,7 @@ function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 function isBareDefaultCodexProviderFailure(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
+		!TERMINAL_ERROR_MESSAGE.test(message.errorMessage ?? "") &&
 		!isExplicitCodexTerminalVeto(message.transportFailure?.providerCode, message.errorMessage) &&
 		(isExactTypedOverloadFacts(message, BARE_DEFAULT_CODEX_RETRYABLE_CODES) ||
 			(BARE_DEFAULT_CODEX_RETRYABLE_ERROR.test(message.errorMessage ?? "") &&
@@ -22991,6 +23007,7 @@ export class AgentSession {
 	}
 
 	#isRetryableError(message: AssistantMessage): boolean {
+		if (isTerminalCodexProviderFailure(message)) return false;
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
 		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return false;
@@ -23118,9 +23135,7 @@ export class AgentSession {
 		// Errors that will never succeed on retry (auth/permission, malformed
 		// request, unknown/unsupported model). These surface immediately rather
 		// than retry forever.
-		return /unauthorized|forbidden|authentication_error|permission_error|permission denied|invalid api key|invalid_request_error|invalid request|bad request|bad_request|validation_error|unprocessable|payload too large|payment required|insufficient_quota|insufficient credits|missing required (parameter|field)|invalid schema|invalid tool_choice|unsupported (parameter|value|model)|model_not_found|no such model|unknown model|does not (exist|support)|request was aborted|request aborted|the user aborted/i.test(
-			errorMessage,
-		);
+		return TERMINAL_ERROR_MESSAGE.test(errorMessage);
 	}
 
 	#extractExplicitHttpStatusFromErrorMessage(errorMessage: string): number | undefined {
@@ -24309,6 +24324,13 @@ export class AgentSession {
 		const classification = this.#classifyErrorForRetry(message);
 		const localSnapshot = classification === "local_snapshot";
 		const localBufferOverflow = classification === "local_buffer_overflow";
+		// Managed outcomes can reach retry handling without the ordinary admission
+		// check. Do not let retained transport facts bypass the same terminal veto.
+		if (isTerminalCodexProviderFailure(message)) {
+			return managedOutcome
+				? { type: "terminal", terminal: { stopReason: "error", messages: [message] } }
+				: false;
+		}
 		if (retryCancelled()) {
 			return managedOutcome ? { type: "terminal", terminal: { stopReason: "cancelled" } } : false;
 		}
