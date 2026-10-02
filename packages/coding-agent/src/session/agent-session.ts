@@ -22998,7 +22998,11 @@ export class AgentSession {
 			return false;
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
-		if (isBareDefaultCodexOverload(message) && this.settings.get("retry.enabled") !== false) return true;
+		if (
+			(isBareDefaultCodexOverload(message) || isBareDefaultCodexProviderFailure(message)) &&
+			this.settings.get("retry.enabled") !== false
+		)
+			return true;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
 		// An account-specific model rejection that cannot rotate to another
 		// credential stays terminal only on the session's own retry path; managed
@@ -24407,7 +24411,9 @@ export class AgentSession {
 		const fallbackTrigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		const trigger:
 			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
-			| undefined = canReplayCodexProviderOverload ? { class: "server" } : fallbackTrigger;
+			| undefined = canReplayCodexProviderOverload || canReplayBareDefaultCodexFailure
+				? { class: "server" }
+				: fallbackTrigger;
 		// OpenAI's typed statusless capacity-overload code (issue #5018) must not
 		// gain managed-chain retry/advance authority from its new facts. Before
 		// the code survived transport, this failure reached the session as an
@@ -24530,6 +24536,7 @@ export class AgentSession {
 			!managedFallback &&
 			classification === "transient" &&
 			!canReplayProviderOverload &&
+			!canReplayBareDefaultCodexFailure &&
 			!canReplayUnexpectedSocketClose &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 
