@@ -1425,7 +1425,6 @@ const BARE_DEFAULT_CODEX_RETRYABLE_ERROR =
 const BARE_DEFAULT_CODEX_RETRYABLE_CODES = new Set(["server_is_overloaded", "server_error", "internal_error"]);
 const BARE_DEFAULT_CODEX_OVERLOAD_ERROR =
 	/^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
-const BARE_DEFAULT_CODEX_OVERLOAD_CODES = new Set([SERVER_OVERLOADED_PROVIDER_CODE]);
 const BARE_DEFAULT_OVERLOAD_CODES = new Set([SERVER_OVERLOADED_PROVIDER_CODE]);
 /** Anthropic's typed capacity-overload `error.type`, the only Anthropic overload code admitted below. */
 const ANTHROPIC_OVERLOADED_ERROR_TYPE = "overloaded_error";
@@ -1558,7 +1557,7 @@ function isStatuslessTypedOverloadFacts(facts: TransportFailureFacts | undefined
 function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
-		(isExactTypedOverloadFacts(message, BARE_DEFAULT_CODEX_OVERLOAD_CODES) ||
+		(isExactTypedOverloadFacts(message, BARE_DEFAULT_OVERLOAD_CODES) ||
 			(BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
 				!hasBareDefaultRetryDisqualifyingFacts(message))) &&
 		!assistantMessageHasVisibleOrToolContent(message)
