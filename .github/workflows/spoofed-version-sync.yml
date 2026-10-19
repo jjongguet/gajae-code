@@ -36,7 +36,7 @@ concurrency:
 jobs:
   drift:
     name: Check spoofed external tool versions
-    runs-on: ubuntu-22.04
+    runs-on: arc-test
     timeout-minutes: 10
     permissions:
       contents: read
