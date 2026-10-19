@@ -19,7 +19,7 @@ concurrency:
 jobs:
   local-public-sync:
     name: Local public surfaces
-    runs-on: arc-test
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -37,9 +37,8 @@ jobs:
 
   live-public-sync:
     name: Live deployed release state
-    # The live target is the upstream production site; a fork must not validate it.
-    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'Yeachan-Heo/gajae-code' }}
-    runs-on: arc-test
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
