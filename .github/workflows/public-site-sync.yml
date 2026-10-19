@@ -37,7 +37,8 @@ jobs:
 
   live-public-sync:
     name: Live deployed release state
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    # The live target is the upstream production site; a fork must not validate it.
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'Yeachan-Heo/gajae-code' }}
     runs-on: arc-test
     timeout-minutes: 10
     steps:
